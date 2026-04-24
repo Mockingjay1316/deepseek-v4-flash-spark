@@ -1,1 +1,5 @@
-../../../blobs/7e1cc78c33123582c00538a830d792cd2ea2f516
+torch>=2.10.0
+transformers>=5.0.0
+safetensors>=0.7.0
+fast_hadamard_transform
+tilelang==0.1.8
