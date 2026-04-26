@@ -49,6 +49,10 @@ class ModelArgs:
     n_heads: int = 64
     # moe
     n_routed_experts: int = 8
+    # Pruned routed-expert count for learned-router (score) layers.
+    # Hash-routed layers (layer_id < n_hash_layers) still use the full
+    # n_routed_experts because tid2eid indices span the full table.
+    n_routed_experts_score: int = 8
     n_shared_experts: int = 1
     n_activated_experts: int = 2
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
@@ -554,12 +558,16 @@ class Gate(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        n_experts = args.n_routed_experts if self.hash else args.n_routed_experts_score
+        assert n_experts >= args.n_activated_experts, (
+            f"n_experts ({n_experts}) < n_activated_experts ({args.n_activated_experts}) at layer {layer_id}"
+        )
+        self.weight = nn.Parameter(torch.empty(n_experts, args.dim))
         if self.hash:
             self.tid2eid = nn.Parameter(torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int32), requires_grad=False)
             self.bias = None
         else:
-            self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+            self.bias = nn.Parameter(torch.empty(n_experts, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = linear(x.float(), self.weight.float())
@@ -613,9 +621,12 @@ class MoE(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
-        assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
-        self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // world_size
+        # Learned-router layers use the pruned expert count; hash layers keep
+        # the full routed-expert set because tid2eid indexes all of them.
+        is_hash = layer_id < args.n_hash_layers
+        self.n_routed_experts = args.n_routed_experts if is_hash else args.n_routed_experts_score
+        assert self.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
+        self.n_local_experts = self.n_routed_experts // world_size
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts

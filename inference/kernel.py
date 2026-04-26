@@ -285,9 +285,14 @@ def sparse_attn_kernel(h: int, d: int, scale=None):
     if scale is None:
         scale = (1.0 / d) ** 0.5
 
-    num_stages = 2
+    # GB10 (sm_121) has ~99 KB dynamic shared memory per block. The original
+    # (num_stages=2, block=64) needs ~141 KB. Shrink block to 16 and drop
+    # pipelining to 1 stage so q_shared (h*d*2) + kv_shared (block*d*2) +
+    # acc_s_cast (h*block*2) stays under the GB10 ceiling. More iterations
+    # (topk/block) but tiles fit.
+    num_stages = 1
     threads = 256
-    block = 64
+    block = 16
     num_blocks = tilelang.cdiv(topk, block)
 
     @T.prim_func
