@@ -2,3 +2,6 @@
 
 !.gitignore
 !build_env.sh
+!try_generate.py
+!try_generate_chat.py
+!mem_probe.py
