@@ -2,7 +2,7 @@
 # Build recipe for running DeepSeek-V4-Flash on DGX Spark (GB10, sm_121, aarch64).
 #
 # Reference environment this was validated against:
-#   - Conda env: deepseek-v4-flash  (Python 3.12.13)
+#   - Python 3.12
 #   - PyTorch 2.11.0+cu130  (built with CXX11 ABI)
 #   - CUDA 13.0.88          (/usr/local/cuda -> cuda-13.0)
 #   - Platform: Linux aarch64, SM_121
