@@ -45,6 +45,14 @@ def _project_sample_to_text(sample: dict, source_spec: dict) -> str:
         msgs = sample.get(text_fields[0])
         if msgs is None:
             return ""
+        # Some HF datasets store the messages list as a JSON-encoded string (e.g.
+        # SWE-bench/SWE-smith-trajectories). Parse if needed; if parsing fails,
+        # the silent-skip in _normalize_text_from_messages will still drop it.
+        if isinstance(msgs, str):
+            try:
+                msgs = json.loads(msgs)
+            except (json.JSONDecodeError, TypeError):
+                return ""
         return _normalize_text_from_messages(msgs)
     join_with = source_spec.get("join_with", "\n\n")
     pieces = []

@@ -55,10 +55,16 @@ def main() -> int:
                         "cost is ~4 GB; budget ~4*chunk_size + 0.25*batch_size + 10 GB total.")
     p.add_argument("--superset-size", type=int, default=0,
                    help="Split calibration into supersets of this many sequences each. "
-                        "Caps inter-chunk activation disk cache to one superset's worth "
-                        "(necessary for reap_full's ~5TB single-batch footprint). "
-                        "0 = no split (one superset = full data). For reap_full, try "
-                        "superset_size=4096 → ~6 supersets, peak disk ~870GB.")
+                        "0 = no split. Mutually exclusive with --superset-token-budget. "
+                        "Use --superset-token-budget instead for recipes with skewed "
+                        "sequence-length distributions (e.g. reap_full).")
+    p.add_argument("--superset-token-budget", type=int, default=0,
+                   help="Greedy-partition calibration into supersets, each holding ≤ this "
+                        "many tokens (sum-of-unpadded-lengths). Caps embed cache size "
+                        "(=tokens × 32 KB) directly, which is what drives RAM OOM. "
+                        "0 = unused. Recommended for reap_full at chunk=16/batch=8: "
+                        "~1_000_000 → ~38 GB worst cache, ~129 supersets. "
+                        "Use calibration/check_superset_size.py to verify a chosen budget.")
     p.add_argument("--max-seq-len", type=int, default=0,
                    help="Max prompt length the standalone Blocks are built for. "
                         "Default 0 = auto-set from recipe's max_seq_len.")
@@ -72,6 +78,9 @@ def main() -> int:
                         "activations forward from the deepest existing cache). "
                         "Default: keep all caches (resume from any layer cheaply).")
     args = p.parse_args()
+
+    if args.superset_size > 0 and args.superset_token_budget > 0:
+        p.error("--superset-size and --superset-token-budget are mutually exclusive")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +135,8 @@ def main() -> int:
         process_mtp=args.process_mtp,
         keep_intermediate_caches=args.keep_intermediate_caches,
         superset_size=args.superset_size if args.superset_size > 0 else None,
+        superset_token_budget=(args.superset_token_budget
+                               if args.superset_token_budget > 0 else None),
     )
     print(f"\n[main] REAP sweep finished in {(time.time()-t_sweep)/60:.1f} min", flush=True)
 

@@ -618,7 +618,7 @@ def process_mtp_chunk(
     print(f"  [mtp.0] build + load 256-expert MTPBlock from HF ...", flush=True)
     t0 = time.time()
     block = build_unpruned_mtp_block(layer_id=base_args.n_layers, base_args=base_args)
-    n_loaded, _ = load_block_from_hf(block, hf_layer_id=0, idx=idx, layer_prefix="mtp")
+    n_loaded, _ = load_block_from_hf(block, layer_id=0, idx=idx, layer_prefix="mtp")
     block.embed = build_and_load_embed(base_args, idx)
     # `block.head` is required by MTPBlock.forward's assert and final call, but we
     # never reach the head call in our custom forward — leave as-is.
@@ -744,6 +744,60 @@ def _load_aggregate_buffer(path: Path) -> Optional[ScoreBuffer]:
     return ScoreBuffer.from_state(state)
 
 
+def _partition_supersets(
+    lengths: List[int],
+    superset_size: Optional[int],
+    superset_token_budget: Optional[int],
+) -> tuple[List[tuple[int, int]], dict]:
+    """Partition sequence indices [0..N) into contiguous supersets.
+
+    Returns (boundaries, signature) where boundaries is a list of (start, end)
+    half-open ranges and signature is a dict describing the strategy (used to
+    detect partition drift across resume runs).
+
+    Strategies:
+      * fixed-size  (superset_size > 0)        — N // size supersets, each `size` seqs
+      * token-budget (superset_token_budget>0) — greedy walk, close out a superset
+        when adding the next seq would exceed budget. A single seq longer than the
+        budget gets its own singleton superset (`if cum > 0` guard).
+      * single (both None / <=0)              — one superset of all seqs
+
+    The disk activation cache is unpadded (per-seq files sliced to actual
+    length), so the byte-exact size of the cache equals
+        sum(lengths[a:b]) * hc_mult * dim * 2
+    Token-budget partitioning bounds this directly. Within a superset the
+    transient padded GPU tensor is bs * max_len_in_batch * hc_mult * dim * 2,
+    which is small (~4 GB for bs=8, len=16384, bf16) and not the OOM driver.
+    """
+    n = len(lengths)
+    if superset_size and superset_token_budget:
+        raise ValueError("set superset_size OR superset_token_budget, not both")
+    if superset_size and superset_size > 0:
+        size = min(superset_size, n)
+        bounds = [(i, min(i + size, n)) for i in range(0, n, size)]
+        sig = {"strategy": "fixed_size", "superset_size": int(size)}
+    elif superset_token_budget and superset_token_budget > 0:
+        budget = int(superset_token_budget)
+        bounds, start, cum = [], 0, 0
+        for i, L in enumerate(lengths):
+            if cum > 0 and cum + L > budget:
+                bounds.append((start, i))
+                start, cum = i, 0
+            cum += L
+        if start < n:
+            bounds.append((start, n))
+        sig = {"strategy": "token_budget", "token_budget": budget}
+    else:
+        bounds = [(0, n)]
+        sig = {"strategy": "single"}
+
+    sig["n_supersets"] = len(bounds)
+    sig["total_seqs"] = n
+    sig["total_tokens"] = int(sum(lengths))
+    sig["boundaries"] = [list(b) for b in bounds]
+    return bounds, sig
+
+
 def reap_full_sweep(
     hf_ckpt_path: str,
     base_args: ModelArgs,
@@ -755,21 +809,25 @@ def reap_full_sweep(
     process_mtp: bool = True,
     keep_intermediate_caches: bool = True,
     superset_size: Optional[int] = None,
+    superset_token_budget: Optional[int] = None,
 ) -> dict[str, dict]:
     """Pipeline-parallel + pure REAP + length-sorted batched calibration.
 
-    With `superset_size`: split calibration into supersets of that many sequences
-    each, process each superset through the full pipeline, accumulate REAP scores
-    globally across supersets. Caps the inter-chunk activation disk cache to one
-    superset's worth of activations instead of the full data — necessary for
-    large recipes (reap_full ≈ 5 TB at 1 superset, fits at ≥3 supersets).
+    Partition strategies (mutually exclusive):
+      * `superset_size=K`            — fixed K seqs per superset
+      * `superset_token_budget=T`    — greedy partition with sum-of-lengths ≤ T
+      * neither                      — single superset = old behavior
 
-    `superset_size=None` (default) runs as a single superset = old behavior.
+    Token-budget is the recommended option for recipes with skewed sequence-length
+    distributions (e.g. reap_full: swe-smith all-max vs evol-codealpaca short).
+    Per-superset embed cache size = total_tokens × hc_mult × dim × 2 (bf16),
+    so the budget directly caps the dirty page-cache footprint that drives RAM OOM.
 
     Layout under out_dir:
         chunks/layers.{L}.json           per-layer aggregate state (cumulative across supersets)
         chunks/mtp.0.json                same for MTP
         chunks/supersets_done.json       list of completed superset indices (resume marker)
+        chunks/superset_partition.json   strategy + boundaries (resume safety: must match on rerun)
         activations/superset_NN/input_to_layer_NN/   per-superset, per-layer per-seq h
         keep_indices.json                final union written at end
     """
@@ -785,14 +843,38 @@ def reap_full_sweep(
     idx = HFShardIndex(hf_ckpt_path)
     print(f"[reap] indexed {len(idx.entries):,} tensors in {time.time()-t0:.1f}s", flush=True)
 
-    # Build supersets.
+    # Build superset partition.
     n_total = len(calib_seqs)
-    if superset_size is None or superset_size >= n_total:
-        supersets = [list(range(n_total))]
+    lengths_all = [int(s.numel()) for s in calib_seqs]
+    bounds, sig = _partition_supersets(
+        lengths_all,
+        superset_size if (superset_size and superset_size < n_total) else None,
+        superset_token_budget,
+    )
+    supersets = [list(range(a, b)) for (a, b) in bounds]
+
+    # Persist or validate partition: any drift on resume corrupts cumulative
+    # aggregates silently, so fail hard if the boundaries don't match.
+    partition_path = chunks_dir / "superset_partition.json"
+    if partition_path.exists():
+        prev = json.loads(partition_path.read_text())
+        if prev.get("boundaries") != sig["boundaries"]:
+            raise RuntimeError(
+                f"superset partition mismatch: previous run used "
+                f"{prev.get('strategy')} ({prev.get('n_supersets')} supersets), "
+                f"this run would use {sig['strategy']} "
+                f"({sig['n_supersets']} supersets). The cumulative aggregates in "
+                f"chunks/layers.*.json are tied to the previous partition; resuming "
+                f"with a different partition would double-count or skip sequences. "
+                f"Wipe {out_dir_p} to start fresh, or restore the prior settings."
+            )
     else:
-        supersets = [list(range(i, min(i + superset_size, n_total)))
-                     for i in range(0, n_total, superset_size)]
-    print(f"[reap] {len(supersets)} superset(s), avg {n_total/len(supersets):.0f} seqs each",
+        partition_path.write_text(json.dumps(sig, indent=2))
+
+    avg_seqs = n_total / len(supersets)
+    avg_tokens = sum(lengths_all) / len(supersets)
+    print(f"[reap] {len(supersets)} superset(s) ({sig['strategy']}), "
+          f"avg {avg_seqs:.0f} seqs / {avg_tokens/1e6:.2f}M tokens each",
           flush=True)
 
     # Persistent score buffers across supersets. Initialize from any saved aggregate
@@ -932,6 +1014,12 @@ def _process_one_superset(
                 json.dumps(_aggregate_to_artifact(body_score_bufs[L], n_keep), indent=2)
             )
         print(f"[reap] chunk done in {time.time()-t_chunk:.1f}s", flush=True)
+        # Reclaim this chunk's INPUT cache: it's no longer needed (the next
+        # chunk reads from out_cache, not in_cache; resume granularity is the
+        # whole superset). Without this, body chunks accumulate 4-5 caches
+        # simultaneously per superset; for the swe-smith-trajectories superset
+        # (~60M tokens × 32 KB/token), that's ~9.6 TB peak per superset on disk.
+        delete_cache_dir(in_cache)
 
     # MTP.
     if process_mtp and base_args.n_mtp_layers > 0:
@@ -951,4 +1039,6 @@ def _process_one_superset(
         (chunks_dir / "mtp.0.json").write_text(
             json.dumps(_aggregate_to_artifact(mtp_score_buf, n_keep), indent=2)
         )
+        # MTP's input cache (last body chunk's out_cache) is now safe to drop.
+        delete_cache_dir(in_cache_mtp)
         print(f"[reap] mtp.0 superset done in {time.time()-t_layer:.1f}s", flush=True)
