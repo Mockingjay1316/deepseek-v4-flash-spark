@@ -1,0 +1,40 @@
+{
+    "name": "reap_full",
+    "description": "Cerebras REAP's published agentic-reasoner calibration mix (24,576 samples). Use this for paper-grade results. Wall-time on a single DGX Spark with the layer-sequential scorer is in the days, not hours - downscale to spark_default.json for first iteration.",
+    "max_seq_len": 16384,
+    "sources": [
+        {
+            "name": "evol-codealpaca",
+            "hf_id": "theblackcat102/evol-codealpaca-v1",
+            "split": "train",
+            "n_samples": 4096,
+            "text_fields": ["instruction", "output"],
+            "join_with": "\n\n"
+        },
+        {
+            "name": "mixture-of-thoughts",
+            "hf_id": "open-r1/Mixture-of-Thoughts",
+            "split": "train",
+            "config": "all",
+            "n_samples": 12288,
+            "text_fields": ["messages"],
+            "messages_format": "concat_role_content"
+        },
+        {
+            "name": "glaive-function-calling",
+            "hf_id": "glaiveai/glaive-function-calling-v2",
+            "split": "train",
+            "n_samples": 4096,
+            "text_fields": ["system", "chat"],
+            "join_with": "\n\n"
+        },
+        {
+            "name": "swe-smith-trajectories",
+            "hf_id": "SWE-bench/SWE-smith-trajectories",
+            "split": "tool",
+            "n_samples": 4096,
+            "text_fields": ["messages"],
+            "messages_format": "concat_role_content"
+        }
+    ]
+}

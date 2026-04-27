@@ -1,0 +1,48 @@
+{
+    "name": "spark_default",
+    "description": "Spark-feasible REAP calibration for V4-Flash. 2,560 samples × 4096 tokens = ~6M tokens of calibration. Adds chat samples on top of REAP's recipe to match the chat -> agentic deployment roadmap. Estimated wall-time on DGX Spark with layer-sequential scoring: 1-2 hours.",
+    "max_seq_len": 4096,
+    "sources": [
+        {
+            "name": "ultrachat",
+            "hf_id": "HuggingFaceH4/ultrachat_200k",
+            "split": "train_sft",
+            "n_samples": 512,
+            "text_fields": ["messages"],
+            "messages_format": "concat_role_content"
+        },
+        {
+            "name": "evol-codealpaca",
+            "hf_id": "theblackcat102/evol-codealpaca-v1",
+            "split": "train",
+            "n_samples": 512,
+            "text_fields": ["instruction", "output"],
+            "join_with": "\n\n"
+        },
+        {
+            "name": "mixture-of-thoughts",
+            "hf_id": "open-r1/Mixture-of-Thoughts",
+            "split": "train",
+            "config": "all",
+            "n_samples": 1024,
+            "text_fields": ["messages"],
+            "messages_format": "concat_role_content"
+        },
+        {
+            "name": "glaive-function-calling",
+            "hf_id": "glaiveai/glaive-function-calling-v2",
+            "split": "train",
+            "n_samples": 256,
+            "text_fields": ["system", "chat"],
+            "join_with": "\n\n"
+        },
+        {
+            "name": "swe-smith-trajectories",
+            "hf_id": "SWE-bench/SWE-smith-trajectories",
+            "split": "tool",
+            "n_samples": 256,
+            "text_fields": ["messages"],
+            "messages_format": "concat_role_content"
+        }
+    ]
+}
