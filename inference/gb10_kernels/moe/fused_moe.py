@@ -66,6 +66,15 @@ def fused_moe_fp4(
             return out
         return torch.zeros((0, dim), dtype=torch.bfloat16, device=x_fp8.device)
 
+    # get_fused_mapping requires contiguous int64 indices; Gate emits int32 for
+    # hash layers (tid2eid lookup) and int64 for score layers (topk).
+    if topk_idx.dtype != torch.int64:
+        topk_idx = topk_idx.to(torch.int64)
+    if not topk_idx.is_contiguous():
+        topk_idx = topk_idx.contiguous()
+    if not topk_weights.is_contiguous():
+        topk_weights = topk_weights.contiguous()
+
     # Routing.
     pos_to_expert, _, _, token_topk_to_pos, *_ = get_fused_mapping(
         topk_idx, num_experts, num_expanded_tokens=0, alignment=alignment,
