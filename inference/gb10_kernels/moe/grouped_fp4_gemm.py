@@ -46,7 +46,8 @@ def grouped_fp4_gemm_kernel(
     act_group_size = 128
     weight_group_size = 32
     block_M = 32
-    block_N = 128
+    block_N = 256  # larger N-tile -> fewer launches per (expert, K-iter); shared
+                    # mem usage ~41 KB (well under sm_121's 99 KB ceiling).
     block_K = 32
     n_sub = act_group_size // block_K  # 4 sub-blocks per act scale group
 
@@ -61,6 +62,12 @@ def grouped_fp4_gemm_kernel(
         scales_b: T.Tensor[(E, N, T.ceildiv(K, weight_group_size)), scale_b_dtype],
         block_to_expert: T.Tensor[(num_blocks_M,), INT32],
     ):
+        # Grid: (N, M). N is the FAST grid axis -- for one M-block (= one
+        # expert), all N-blocks are scheduled consecutively, so the bx loop
+        # within a fixed by reuses B[expert_id, :, :] in L2. We also keep
+        # this order because M-fast (which seems "natural") interleaves
+        # different experts across consecutive blocks and KILLS B-reuse
+        # (measured: M-fast adds ~30 ms = +26% to moe.fused at 4096 tokens).
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             expert_id = block_to_expert[by]
 
@@ -82,11 +89,13 @@ def grouped_fp4_gemm_kernel(
             scale_a_frag = T.alloc_fragment((block_M,), FP32)
             scale_b_frag = T.alloc_fragment((block_N,), FP32)
 
-            # NB: do NOT enable T.use_swizzle here. The existing
-            # inference/kernel.py:fp4_gemm uses panel_size=10 for L2 reordering,
-            # but with a dynamic expert_id the swizzle reorders kernel-block
-            # scheduling such that B[expert_id, ...] reads point to the wrong
-            # expert (rms balloons to ~1.4). Tested empirically.
+            # NB: T.use_swizzle is incompatible with our dynamic expert_id
+            # (any panel_size > 1 produces rms ~1 vs reference). The TileLang
+            # swizzle reorders kernel-block scheduling in a way that breaks
+            # the block_to_expert lookup; the swizzle's index mapping is
+            # opaque so we can't pre-bake it into block_to_expert. Instead we
+            # rely on the M-fast grid axis (above) for implicit L2 reuse of
+            # B[expert_id] across consecutive blocks of one expert.
             T.clear(C_local)
             T.clear(C_local_accum)
 
