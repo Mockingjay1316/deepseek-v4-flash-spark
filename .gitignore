@@ -1,5 +1,8 @@
 # Ignore pycache
 __pycache__
 
-
 .vscode
+
+# Generated artifacts: pruned checkpoints, calibration caches, score logs.
+# Reproducible from upstream HF + scripts in calibration/ and inference/convert.py.
+runs/
