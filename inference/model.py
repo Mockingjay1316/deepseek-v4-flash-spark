@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
+from gb10_kernels.moe import fused_moe_fp4
 
 
 world_size = 1
@@ -616,43 +617,72 @@ class Expert(nn.Module):
 
 class MoE(nn.Module):
     """Mixture-of-Experts: gate routes each token to top-k routed experts + 1 shared expert.
-    Experts are sharded across TP ranks; each rank handles n_routed_experts // world_size experts."""
+
+    Routed experts are stored as four stacked Parameters (no ModuleList) so the
+    fused-MoE pipeline (gb10_kernels.moe.fused_moe_fp4) can dispatch them in
+    three grouped GEMM launches per layer instead of 3 * n_routed_experts.
+
+    Stacked layout (FP4 weights + E8M0 scales):
+      experts_w13       [E, 2 * inter, dim // 2]  - gate (w1) concat up (w3) along axis 1
+      experts_w13_scale [E, 2 * inter, dim // 32]
+      experts_w2        [E, dim, inter // 2]
+      experts_w2_scale  [E, dim, inter // 32]
+    where E == n_routed_experts (256 for hash layers; n_routed_experts_score otherwise).
+
+    The on-disk safetensors layout is unchanged (per-expert tensors); the
+    translation happens in load_streaming.load_direct, which slices each
+    per-expert tensor into the right segment of the stacked Parameter.
+
+    TP-shard support is currently dropped (E must be divisible by world_size = 1);
+    fused MoE assumes a single rank holds the full expert set.
+    """
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
+        self.inter = args.moe_inter_dim
+        self.swiglu_limit = args.swiglu_limit
         # Learned-router layers use the pruned expert count; hash layers keep
         # the full routed-expert set because tid2eid indexes all of them.
         is_hash = layer_id < args.n_hash_layers
         self.n_routed_experts = args.n_routed_experts if is_hash else args.n_routed_experts_score
-        assert self.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
-        self.n_local_experts = self.n_routed_experts // world_size
+        assert world_size == 1, "fused MoE path requires world_size=1 (TP not supported here yet)"
         self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
-        expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                       for i in range(self.n_routed_experts)])
+        assert args.expert_dtype == "fp4", "fused MoE assumes FP4 routed experts"
+        E = self.n_routed_experts
+        # Stacked routed-expert weights + scales.
+        self.experts_w13 = nn.Parameter(torch.empty(
+            E, 2 * self.inter, self.dim // 2, dtype=torch.float4_e2m1fn_x2,
+        ))
+        self.experts_w13_scale = nn.Parameter(torch.empty(
+            E, 2 * self.inter, self.dim // fp4_block_size, dtype=torch.float8_e8m0fnu,
+        ))
+        self.experts_w2 = nn.Parameter(torch.empty(
+            E, self.dim, self.inter // 2, dtype=torch.float4_e2m1fn_x2,
+        ))
+        self.experts_w2_scale = nn.Parameter(torch.empty(
+            E, self.dim, self.inter // fp4_block_size, dtype=torch.float8_e8m0fnu,
+        ))
         assert args.n_shared_experts == 1
-        # no swiglu_limit
+        # Shared expert is BF16 (single per layer; no SwiGLU clamp).
         self.shared_experts = Expert(args.dim, args.moe_inter_dim)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
-        if world_size > 1:
-            dist.all_reduce(y)
-        y += self.shared_experts(x)
+        # Quantize x once for the fused path (FP32 act scales: gb10_kernels contract).
+        x_fp8, x_sf = act_quant(x, block_size, scale_dtype=torch.float32)
+        y = fused_moe_fp4(
+            x_fp8, x_sf,
+            topk_weights=weights, topk_idx=indices,
+            w13=self.experts_w13, w13_sf=self.experts_w13_scale,
+            w2=self.experts_w2, w2_sf=self.experts_w2_scale,
+            num_experts=self.n_routed_experts,
+            swiglu_limit=self.swiglu_limit,
+        )
+        y = y + self.shared_experts(x)
         return y.type_as(x).view(shape)
 
 
