@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
 from gb10_kernels.moe import fused_moe_fp4
+from gb10_kernels.mhc import mhc_pre_big_fuse, mhc_post_fwd
 
 
 world_size = 1
@@ -729,16 +730,24 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        post, comb, x = mhc_pre_big_fuse(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            rms_eps=self.norm_eps, hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+        )
         x = self.attn_norm(x)
         x = self.attn(x, start_pos)
-        x = self.hc_post(x, residual, post, comb)
+        x = mhc_post_fwd(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        post, comb, x = mhc_pre_big_fuse(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            rms_eps=self.norm_eps, hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+        )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        x = mhc_post_fwd(x, residual, post, comb)
         return x
 
 
