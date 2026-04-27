@@ -754,13 +754,18 @@ class ParallelHead(nn.Module):
         # lm_head in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for easier computation of logits later.
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
-    def get_logits(self, x):
+    def get_logits(self, x, all_positions: bool = False):
+        # x: [b, s, dim]. Default: last position only -> [b, vocab].
+        # all_positions=True -> [b, s, vocab]. Used by speculative decode verify.
+        if all_positions:
+            return F.linear(x.float(), self.weight)
         return F.linear(x[:, -1].float(), self.weight)
 
-    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
+                hc_base: torch.Tensor, norm: RMSNorm, all_positions: bool = False):
         # x: [b,s,hc,d]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = self.get_logits(norm(x))
+        logits = self.get_logits(norm(x), all_positions=all_positions)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
@@ -841,13 +846,27 @@ class Transformer(nn.Module):
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0,
+                all_logits: bool = False, return_h: bool = False):
+        """Run the main transformer.
+
+        Args:
+          all_logits: if True, return logits at every input position (needed
+            for speculative-decode verify). Default False = last position only.
+          return_h: if True, also return h_after_layers [b, s, hc, dim] (post
+            final Block, pre-head). Used to feed MTPBlock for speculative
+            drafting.
+        """
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer(h, start_pos, input_ids)
-        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        logits = self.head(h, self.hc_head_fn, self.hc_head_scale,
+                            self.hc_head_base, self.norm,
+                            all_positions=all_logits)
+        if return_h:
+            return logits, h
         return logits
 
 

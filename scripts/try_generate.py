@@ -57,6 +57,95 @@ def generate_tokens(
     return tokens[0, n_prompt : cur_pos + 1].tolist()
 
 
+@torch.inference_mode()
+def generate_tokens_mtp(
+    model: Transformer,
+    prompt_tokens: List[int],
+    max_new_tokens: int,
+    eos_id: int,
+    temperature: float = 0.0,
+) -> tuple[List[int], dict]:
+    """MTP speculative decoding (k=1, greedy).
+
+    Plumbing for the trained MTPBlock as a draft head, then verifies the draft
+    via a 1-token main forward at the next position. Acceptance rate is recorded
+    but the per-step verify currently uses a SINGLE-TOKEN main forward (rather
+    than a batched 2-token verify), so this path does NOT yield a wall-clock
+    speedup yet.
+
+    The 2-token batched verify -- which is what produces the actual speedup --
+    is blocked on `inference/kernel.py:sparse_attn_kernel` JIT-binding its
+    symbolic q-seqlen on first call (seqlen=1 from regular decode), so a later
+    seqlen=2 verify call fails with a shape assertion. Resolving that needs a
+    real fix to either the TileLang kernel template or the sparse_attn cache
+    key (we tried both; both have second-order issues with prefill calls
+    sharing the cache).
+
+    Greedy only. Sampling MTP requires rejection sampling for valid spec-decode
+    semantics and is out of scope.
+    """
+    if temperature > 0:
+        raise NotImplementedError("MTP speculative decode currently supports greedy only.")
+    if not getattr(model, "mtp", None) or len(model.mtp) == 0:
+        raise RuntimeError("model has no MTP block (n_mtp_layers must be >= 1).")
+    mtp = model.mtp[0]
+
+    total_len = min(model.max_seq_len, max_new_tokens + len(prompt_tokens))
+    tokens = torch.full((1, total_len), -1, dtype=torch.long)
+    n_prompt = len(prompt_tokens)
+    tokens[0, :n_prompt] = torch.tensor(prompt_tokens, dtype=torch.long)
+
+    stats = {"accepted": 0, "rejected": 0, "main_calls": 0}
+
+    # Init: prefill, predict t_{n_prompt}.
+    logits_init, h_init = model.forward(
+        tokens[:, :n_prompt], start_pos=0, return_h=True,
+    )
+    stats["main_calls"] += 1
+    next_tok = logits_init.argmax(dim=-1)  # [1] = t_{n_prompt}
+    tokens[0, n_prompt] = next_tok[0]
+    if int(next_tok[0].item()) == eos_id:
+        return tokens[0, n_prompt:n_prompt + 1].tolist(), stats
+
+    # Draft t_{n_prompt+1}.
+    draft = int(mtp(
+        h_init[:, -1:], start_pos=n_prompt,
+        input_ids=next_tok.view(1, 1).to(torch.int64),
+    ).argmax(dim=-1)[0].item())
+
+    cur_pos = n_prompt + 1
+
+    while cur_pos < total_len:
+        # 1-token main forward at position cur_pos-1 -> predicts t_{cur_pos} (true)
+        # AND advances main KV by one. Output h is at position cur_pos-1.
+        m_logits, m_h = model.forward(
+            tokens[:, cur_pos - 1:cur_pos], start_pos=cur_pos - 1,
+            return_h=True,
+        )
+        stats["main_calls"] += 1
+        true_at_cur = int(m_logits.argmax(dim=-1)[0].item())
+
+        if true_at_cur == draft:
+            stats["accepted"] += 1
+        else:
+            stats["rejected"] += 1
+        # Either way commit the true value.
+        tokens[0, cur_pos] = true_at_cur
+        if true_at_cur == eos_id:
+            cur_pos += 1
+            break
+        cur_pos += 1
+        if cur_pos >= total_len:
+            break
+        # Next draft from MTP using h at the just-committed position.
+        draft = int(mtp(
+            m_h[:, -1:], start_pos=cur_pos - 1,
+            input_ids=tokens[:, cur_pos - 1:cur_pos].to(torch.int64),
+        ).argmax(dim=-1)[0].item())
+
+    return tokens[0, n_prompt:cur_pos].tolist(), stats
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt-path", required=True)
@@ -70,6 +159,9 @@ def main() -> int:
     p.add_argument("--direct-load", action="store_true", default=True,
                    help="Use mmap-free pread+fadvise loader. Default True to avoid 2x RAM peak.")
     p.add_argument("--no-direct-load", dest="direct_load", action="store_false")
+    p.add_argument("--mtp", action="store_true",
+                   help="Use MTP speculative decoding (greedy only). "
+                        "Drafts one extra token per step from the trained MTP block.")
     args = p.parse_args()
 
     os.environ.setdefault("WORLD_SIZE", "1")
@@ -114,16 +206,35 @@ def main() -> int:
     print(f"prompt ids: {prompt_ids}")
 
     t0 = time.time()
-    out_ids = generate_tokens(
-        model, prompt_ids,
-        max_new_tokens=args.max_new_tokens,
-        eos_id=eos_id,
-        temperature=args.temperature,
-    )
+    if args.mtp:
+        if args.temperature > 0:
+            print("[warn] --mtp requires greedy; forcing temperature=0")
+        out_ids, mtp_stats = generate_tokens_mtp(
+            model, prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_id=eos_id,
+            temperature=0.0,
+        )
+    else:
+        out_ids = generate_tokens(
+            model, prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_id=eos_id,
+            temperature=args.temperature,
+        )
+        mtp_stats = None
     dt = time.time() - t0
     completion = tokenizer.decode(out_ids, skip_special_tokens=False)
     print(f"\n[{dt:.1f}s to generate {len(out_ids)} new tokens, "
           f"{len(out_ids) / dt:.2f} tok/s]")
+    if mtp_stats is not None:
+        total = mtp_stats["accepted"] + mtp_stats["rejected"]
+        accept_rate = mtp_stats["accepted"] / max(total, 1)
+        print(f"[mtp] accepted={mtp_stats['accepted']} rejected={mtp_stats['rejected']} "
+              f"accept_rate={accept_rate*100:.1f}%  main_calls={mtp_stats['main_calls']}")
+        print(f"[mtp] NOTE: current path uses 1-token verify (no wall-clock speedup); "
+              f"batched 2-token verify is blocked on sparse_attn shape binding (see "
+              f"scripts/try_generate.py docstring).")
     print()
     print("=== PROMPT ===")
     print(args.prompt)
