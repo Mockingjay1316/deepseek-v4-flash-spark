@@ -334,18 +334,32 @@ def load_block_from_hf(block: Block, layer_id: int, idx: HFShardIndex, layer_pre
 ) -> tuple[int, int]:
     """Load all weights for one standalone Block from upstream HF.
 
+    Walks the HF tensor table once and routes each entry into:
+      (a) a direct state_dict key if present, or
+      (b) the right slice of a stacked-experts Param (experts_w13, etc.).
+
     layer_prefix: "layers" for the body, "mtp" for the MTP block.
     Returns (n_loaded, n_skipped).
     """
+    from load_streaming import _resolve_expert_target  # noqa: WPS433  (local import to avoid cycles)
+
     ref_to_hf = _build_ref_to_hf_map(idx)
     sd = block.state_dict()
     n_loaded, n_skipped = 0, 0
-    for ref_name, target in sd.items():
-        full_ref = f"{layer_prefix}.{layer_id}.{ref_name}"
-        hf_name = ref_to_hf.get(full_ref)
-        if hf_name is None:
-            n_skipped += 1
+    layer_pfx = f"{layer_prefix}.{layer_id}."
+    for ref_name, hf_name in ref_to_hf.items():
+        if not ref_name.startswith(layer_pfx):
             continue
+        local_ref = ref_name[len(layer_pfx):]
+
+        target = sd.get(local_ref)
+        if target is None:
+            resolved = _resolve_expert_target(sd, local_ref)
+            if resolved is None:
+                n_skipped += 1
+                continue
+            target, _stacked_key = resolved
+
         t = idx.read_tensor(hf_name)
         if t.dtype == torch.int8 and target.dtype == torch.float4_e2m1fn_x2:
             t = t.view(torch.float4_e2m1fn_x2)
@@ -385,30 +399,77 @@ def build_and_load_embed(base_args: ModelArgs, idx: HFShardIndex, device: str = 
 # ---------------------------------------------------------------------------
 
 def _make_hooked_moe_forward(score_buf: ScoreBuffer, valid_mask_flat: torch.Tensor) -> Callable:
-    """Replace MoE.forward to record REAP scores ONLY at valid (non-padded) positions.
+    """Replace MoE.forward to record REAP scores at valid (non-padded) positions.
 
-    Output for ALL positions (including padded) is still computed so the batched
-    shape stays correct; we just don't accumulate scores for padded slots, and
-    we drop padded positions when saving outputs to disk.
+    Calibration needs per-(token, expert) (gate_weight, ||raw_expert_output||).
+    With the fused MoE in inference/model.py, the per-expert loop is gone; we
+    inline the gb10_kernels building blocks here so we can capture y_expanded
+    (the per-position raw expert output, before reduce). Per-position score
+    extraction is then a single vectorized scatter-add per layer.
     """
+    from gb10_kernels.moe.mapping import get_fused_mapping
+    from gb10_kernels.moe.expand import expand_to_fused_with_sf
+    from gb10_kernels.moe.grouped_fp4_gemm import grouped_fp4_gemm, _build_block_to_expert
+    from gb10_kernels.moe.reduce import reduce_fused
+    from gb10_kernels.quant.swiglu_quant import swiglu_forward_and_per_token_cast
+    from kernel import act_quant
+
     def hooked_forward(self: MoE, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            w_per_token = weights[idx, top]
-            raw_out = expert(x[idx])
-            y[idx] += w_per_token.unsqueeze(-1) * raw_out
-            v = valid_mask_flat[idx]
-            if v.any():
-                score_buf.add(i, w_per_token[v], raw_out.float().norm(dim=-1)[v])
-        y += self.shared_experts(x)
+        x_fp8, x_sf = act_quant(x, block_size=128, scale_dtype=torch.float32)
+
+        # Routing + scatter.
+        pos_to_expert, pos_to_token, pos_to_token_topk, token_topk_to_pos, *_ = (
+            get_fused_mapping(indices, self.n_routed_experts,
+                              num_expanded_tokens=0, alignment=32))
+        block_to_expert = _build_block_to_expert(pos_to_expert, block_M=32)
+        expanded_x, expanded_x_sf = expand_to_fused_with_sf(
+            x_fp8, x_sf, num_per_channels=128,
+            token_topk_to_pos=token_topk_to_pos, pos_to_expert=pos_to_expert,
+            use_tma_aligned_col_major_sf=False,
+        )
+
+        # W13 GEMM -> SwiGLU+quant -> W2 GEMM.
+        gate_up = grouped_fp4_gemm(
+            expanded_x, expanded_x_sf,
+            self.experts_w13, self.experts_w13_scale, pos_to_expert,
+            block_to_expert=block_to_expert,
+        )
+        y_fp8, y_sf = swiglu_forward_and_per_token_cast(
+            gate_up, pos_to_expert, self.swiglu_limit, sf_block=128,
+        )
+        y_expanded = grouped_fp4_gemm(
+            y_fp8, y_sf,
+            self.experts_w2, self.experts_w2_scale, pos_to_expert,
+            block_to_expert=block_to_expert,
+        )
+
+        # Score extraction: per-position (gate_weight, ||y_expanded||) by expert.
+        valid_pos_mask = pos_to_expert >= 0
+        if valid_pos_mask.any():
+            valid_pos = valid_pos_mask.nonzero(as_tuple=True)[0]  # int64
+            v_expert = pos_to_expert[valid_pos]                   # int32
+            v_token = pos_to_token[valid_pos].long()              # int64
+            v_token_topk = pos_to_token_topk[valid_pos].long()    # flat (token*K+k)
+            norms = y_expanded[valid_pos].float().norm(dim=-1)    # [n_valid] FP32
+            flat_w = weights.reshape(-1)
+            v_gate = flat_w[v_token_topk]                         # [n_valid] FP32
+            v_token_valid = valid_mask_flat[v_token]              # [n_valid] bool
+            mask = v_token_valid
+            if mask.any():
+                v_expert_m = v_expert[mask]
+                v_gate_m = v_gate[mask]
+                v_norms_m = norms[mask]
+                # Per-expert accumulate. Keeps score_buf.add API; no perf-critical here.
+                for e in v_expert_m.unique().tolist():
+                    em = v_expert_m == int(e)
+                    score_buf.add(int(e), v_gate_m[em], v_norms_m[em])
+
+        # Reduce + shared expert.
+        y = reduce_fused(y_expanded, weights, token_topk_to_pos)
+        y = y + self.shared_experts(x)
         return y.type_as(x).view(shape)
     return hooked_forward
 
